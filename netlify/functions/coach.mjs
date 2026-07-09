@@ -1,6 +1,9 @@
+import { randomUUID } from "node:crypto";
+
 const GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/interactions";
-const GEMINI_MODEL = "gemini-3.5-flash";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
 const MAX_SENTENCE_LENGTH = 500;
+const GEMINI_TIMEOUT_MS = 14_000;
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_MAX_REQUESTS = 10;
 
@@ -71,74 +74,65 @@ const responseSchema = {
   additionalProperties: false
 };
 
-const systemInstruction = `You are Nativo, a calm, minimalist, science-based language coach.
-
-Your goal is to help the user express real thoughts naturally in the target language.
-
-You receive:
-
-* nativeLanguage: the user's language for explanations
-* targetLanguage: the language the user wants to learn
-* level: the user's current level
-* userSentence: the sentence the user wants to say
-
-Rules:
-
-1. Translate the user's sentence naturally into the target language.
-2. Do not translate word-for-word if it sounds unnatural.
-3. Explain only one or two important grammar points.
-4. Keep explanations short and simple.
-5. Explain grammar in the user's native language.
-6. Extract useful chunks and phrases, not isolated vocabulary.
-7. Give two or three similar real-life examples.
-8. Create one active recall prompt.
-9. Do not create multiple-choice exercises.
-10. Do not create lessons.
-11. Do not use gamified language.
-12. Do not overload the user.
-13. Return only valid JSON.
-14. Do not include markdown.
-15. Do not include extra text outside the JSON.`;
+const systemInstruction = `You are Nativo, a calm science-based language coach. Return only strict JSON with exactly these keys: naturalTranslation, literalMeaning, simpleGrammar, usefulChunks, similarExamples, tryAgainPrompt. Translate naturally into targetLanguage. Write literalMeaning, simpleGrammar, usefulChunks.meaning, and tryAgainPrompt in nativeLanguage. Write naturalTranslation, usefulChunks.chunk, and similarExamples in targetLanguage. Keep output short. Use 2-5 phrase chunks, not isolated words. Use 2-3 similar examples. No markdown, lessons, games, or multiple-choice.`;
 
 export default async function handler(req, context) {
+  const requestId = randomUUID();
+  safeLog(requestId, "coach request received", { method: req.method });
+
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: jsonHeaders });
   }
 
   if (req.method !== "POST") {
-    return jsonResponse({ error: "Method not allowed." }, 405);
+    return errorResponse("METHOD_NOT_ALLOWED", "Method not allowed.", 405);
   }
 
   const rateLimit = checkRateLimit(getClientKey(req, context));
   if (!rateLimit.allowed) {
-    return jsonResponse({ error: "Too many requests. Please wait a moment and try again." }, 429);
+    safeLog(requestId, "validation failed reason", { reason: "RATE_LIMITED" });
+    return errorResponse("RATE_LIMITED", "Too many requests. Please wait a moment and try again.", 429);
   }
 
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    return jsonResponse({ error: "Gemini API key is not configured." }, 500);
+    safeLog(requestId, "validation failed reason", { reason: "MISSING_GEMINI_API_KEY" });
+    return errorResponse("SERVER_MISCONFIGURED", "Gemini API key is not configured.", 500);
   }
 
   let payload;
   try {
     payload = await req.json();
   } catch {
-    return jsonResponse({ error: "Invalid JSON request body." }, 400);
+    safeLog(requestId, "validation failed reason", { reason: "INVALID_JSON_BODY" });
+    return errorResponse("INVALID_JSON_BODY", "Invalid JSON request body.", 400);
   }
 
   const validationError = validatePayload(payload);
   if (validationError) {
-    return jsonResponse({ error: validationError }, 400);
+    safeLog(requestId, "validation failed reason", { reason: validationError.code });
+    return errorResponse(validationError.code, validationError.message, 400);
   }
 
   const userSentence = payload.userSentence.trim().slice(0, MAX_SENTENCE_LENGTH);
   const nativeLanguage = payload.nativeLanguage.trim();
   const targetLanguage = payload.targetLanguage.trim();
   const level = (payload.level || "Beginner").trim();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
 
   try {
+    safeLog(requestId, "Gemini request started", {
+      model: GEMINI_MODEL,
+      nativeLanguage,
+      targetLanguage,
+      level,
+      sentenceLength: userSentence.length
+    });
+
     const geminiResponse = await fetch(GEMINI_ENDPOINT, {
       method: "POST",
+      signal: controller.signal,
       headers: {
         "Content-Type": "application/json",
         "x-goog-api-key": apiKey
@@ -153,9 +147,9 @@ export default async function handler(req, context) {
           userSentence
         }),
         generation_config: {
-          temperature: 0.35,
+          temperature: 0.2,
           thinking_level: "low",
-          max_output_tokens: 800
+          max_output_tokens: 500
         },
         response_format: {
           type: "text",
@@ -164,44 +158,82 @@ export default async function handler(req, context) {
         }
       })
     });
+    clearTimeout(timeout);
+
+    safeLog(requestId, "Gemini response received", { status: geminiResponse.status, ok: geminiResponse.ok });
 
     if (!geminiResponse.ok) {
-      return jsonResponse({ error: "Gemini request failed." }, 502);
+      safeLog(requestId, "validation failed reason", { reason: "GEMINI_REQUEST_FAILED", status: geminiResponse.status });
+      return errorResponse("GEMINI_REQUEST_FAILED", "Gemini request failed.", 502);
     }
 
     const geminiData = await geminiResponse.json();
     const outputText = extractOutputText(geminiData);
-    const parsed = JSON.parse(outputText);
+    safeLog(requestId, "Gemini response text length", { length: outputText.length });
+
+    const jsonText = extractJsonObjectText(outputText);
+    const parsed = parseJsonText(jsonText);
+    const parsedValidationError = validateCoachResponse(parsed);
+    if (parsedValidationError) {
+      safeLog(requestId, "validation failed reason", { reason: parsedValidationError });
+      return errorResponse("AI_RESPONSE_VALIDATION_FAILED", "Gemini response did not match the expected shape.", 502);
+    }
+
     const normalized = normalizeCoachResponse(parsed);
+    const normalizedValidationError = validateCoachResponse(normalized);
+    if (normalizedValidationError) {
+      safeLog(requestId, "validation failed reason", { reason: normalizedValidationError });
+      return errorResponse("AI_RESPONSE_VALIDATION_FAILED", "Gemini response did not match the expected shape.", 502);
+    }
+
+    safeLog(requestId, "JSON parsed successfully", {
+      chunkCount: normalized.usefulChunks.length,
+      exampleCount: normalized.similarExamples.length
+    });
 
     return jsonResponse(normalized, 200);
-  } catch {
-    return jsonResponse({ error: "Coach response could not be generated." }, 502);
+  } catch (error) {
+    clearTimeout(timeout);
+    if (error?.name === "AbortError") {
+      safeLog(requestId, "Gemini request timed out", { timeoutMs: GEMINI_TIMEOUT_MS });
+      return errorResponse("GEMINI_REQUEST_TIMEOUT", "Gemini request timed out.", 504);
+    }
+
+    if (error instanceof SyntaxError || error?.code === "AI_RESPONSE_PARSE_FAILED") {
+      safeLog(requestId, "validation failed reason", { reason: "AI_RESPONSE_PARSE_FAILED" });
+      return errorResponse("AI_RESPONSE_PARSE_FAILED", "Could not parse Gemini response.", 502);
+    }
+
+    safeLog(requestId, "validation failed reason", { reason: "COACH_RESPONSE_FAILED" });
+    return errorResponse("COACH_RESPONSE_FAILED", "Coach response could not be generated.", 502);
   }
 }
 
 function validatePayload(payload) {
   if (!payload || typeof payload !== "object") {
-    return "Missing request body.";
+    return { code: "MISSING_BODY", message: "Missing request body." };
   }
 
   if (typeof payload.userSentence !== "string" || !payload.userSentence.trim()) {
-    return "Missing userSentence.";
+    return { code: "MISSING_USER_SENTENCE", message: "Missing userSentence." };
   }
 
   if (payload.userSentence.length > MAX_SENTENCE_LENGTH) {
-    return `userSentence must be ${MAX_SENTENCE_LENGTH} characters or fewer.`;
+    return {
+      code: "USER_SENTENCE_TOO_LONG",
+      message: `userSentence must be ${MAX_SENTENCE_LENGTH} characters or fewer.`
+    };
   }
 
   if (typeof payload.nativeLanguage !== "string" || !payload.nativeLanguage.trim()) {
-    return "Missing nativeLanguage.";
+    return { code: "MISSING_NATIVE_LANGUAGE", message: "Missing nativeLanguage." };
   }
 
   if (typeof payload.targetLanguage !== "string" || !payload.targetLanguage.trim()) {
-    return "Missing targetLanguage.";
+    return { code: "MISSING_TARGET_LANGUAGE", message: "Missing targetLanguage." };
   }
 
-  return "";
+  return null;
 }
 
 function normalizeCoachResponse(value) {
@@ -244,6 +276,92 @@ function extractOutputText(data) {
   throw new Error("No Gemini output text found.");
 }
 
+function extractJsonObjectText(text) {
+  const trimmed = String(text ?? "").trim();
+  if (!trimmed) {
+    throw parseError("Empty Gemini response text.");
+  }
+
+  const fencedMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = fencedMatch ? fencedMatch[1].trim() : trimmed;
+
+  if (candidate.startsWith("{") && candidate.endsWith("}")) {
+    return candidate;
+  }
+
+  const start = candidate.indexOf("{");
+  const end = candidate.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) {
+    throw parseError("No JSON object found in Gemini response.");
+  }
+
+  return candidate.slice(start, end + 1);
+}
+
+function parseJsonText(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw parseError("Invalid JSON returned by Gemini.");
+  }
+}
+
+function parseError(message) {
+  const error = new Error(message);
+  error.code = "AI_RESPONSE_PARSE_FAILED";
+  return error;
+}
+
+function validateCoachResponse(value) {
+  const expectedKeys = [
+    "naturalTranslation",
+    "literalMeaning",
+    "simpleGrammar",
+    "usefulChunks",
+    "similarExamples",
+    "tryAgainPrompt"
+  ];
+  const actualKeys = Object.keys(value ?? {}).sort();
+  const sortedExpected = [...expectedKeys].sort();
+  if (JSON.stringify(actualKeys) !== JSON.stringify(sortedExpected)) {
+    return "AI_RESPONSE_KEYS_INVALID";
+  }
+
+  for (const key of ["naturalTranslation", "literalMeaning", "simpleGrammar", "tryAgainPrompt"]) {
+    if (typeof value[key] !== "string") {
+      return `${key.toUpperCase()}_INVALID`;
+    }
+  }
+
+  if (!value.naturalTranslation || !value.simpleGrammar || !value.tryAgainPrompt) {
+    return "AI_RESPONSE_REQUIRED_TEXT_MISSING";
+  }
+
+  if (!Array.isArray(value.usefulChunks) || value.usefulChunks.length < 1 || value.usefulChunks.length > 5) {
+    return "USEFUL_CHUNKS_INVALID";
+  }
+
+  for (const chunk of value.usefulChunks) {
+    const chunkKeys = Object.keys(chunk ?? {}).sort();
+    if (JSON.stringify(chunkKeys) !== JSON.stringify(["chunk", "meaning"])) {
+      return "USEFUL_CHUNK_KEYS_INVALID";
+    }
+    if (typeof chunk.chunk !== "string" || !chunk.chunk || typeof chunk.meaning !== "string" || !chunk.meaning) {
+      return "USEFUL_CHUNK_VALUES_INVALID";
+    }
+  }
+
+  if (!Array.isArray(value.similarExamples) || value.similarExamples.length < 1 || value.similarExamples.length > 3) {
+    return "SIMILAR_EXAMPLES_INVALID";
+  }
+
+  if (value.similarExamples.some((example) => typeof example !== "string" || !example)) {
+    return "SIMILAR_EXAMPLES_VALUES_INVALID";
+  }
+
+  return "";
+}
+
 function getClientKey(req, context) {
   return (
     context?.ip ||
@@ -271,4 +389,16 @@ function jsonResponse(body, status) {
     status,
     headers: jsonHeaders
   });
+}
+
+function errorResponse(error, message, status) {
+  return jsonResponse({ error, message }, status);
+}
+
+function safeLog(requestId, event, details = {}) {
+  console.log(JSON.stringify({
+    requestId,
+    event,
+    ...details
+  }));
 }

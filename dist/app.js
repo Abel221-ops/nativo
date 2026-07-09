@@ -1528,7 +1528,10 @@ function bindHome() {
       state.latestCard = await coachService.analyze(text, state.profile);
       state.coachStatus = "idle";
       state.coachError = "";
-    } catch {
+    } catch (error) {
+      console.error("Nativo coach request failed", error?.details ?? {
+        message: error?.message ?? "Unknown error"
+      });
       state.latestCard = null;
       state.coachStatus = "error";
       state.coachError = t("home.errorMessage");
@@ -2023,12 +2026,28 @@ const coachService = {
       })
     });
 
+    const data = await readJsonResponse(response);
+
     if (!response.ok) {
-      throw new Error("Coach request failed.");
+      const error = new Error(data?.message || "Coach request failed.");
+      error.details = {
+        status: response.status,
+        error: data?.error || "COACH_REQUEST_FAILED",
+        message: data?.message || "Coach request failed."
+      };
+      throw error;
     }
 
-    const data = await response.json();
-    return shapeApiResponse(source, targetLocale, data);
+    try {
+      return shapeApiResponse(source, targetLocale, data);
+    } catch (shapeError) {
+      shapeError.details = {
+        error: "FRONTEND_RESPONSE_SHAPE_INVALID",
+        message: shapeError.message,
+        keys: Object.keys(data ?? {})
+      };
+      throw shapeError;
+    }
   },
 
   correctSpeech(_transcript, profile) {
@@ -2039,6 +2058,17 @@ const coachService = {
     };
   }
 };
+
+async function readJsonResponse(response) {
+  try {
+    return await response.json();
+  } catch {
+    return {
+      error: "INVALID_JSON_RESPONSE",
+      message: "The coach endpoint did not return valid JSON."
+    };
+  }
+}
 
 function shapeApiResponse(source, targetLocale, data) {
   const chunks = Array.isArray(data.usefulChunks)

@@ -39,6 +39,14 @@ GEMINI_API_KEY=your_real_key_here
 
 Do not put the key in `index.html`, `app.js`, or any browser code. The frontend calls `/.netlify/functions/coach`, and the function reads `GEMINI_API_KEY` on the server.
 
+Optional model override:
+
+```text
+GEMINI_MODEL=gemini-2.5-flash-lite
+```
+
+The function defaults to `gemini-2.5-flash-lite`, a fast low-cost model suitable for this prototype. You can override it in Netlify if Google changes model availability.
+
 ### Build Locally
 
 ```bash
@@ -99,6 +107,20 @@ curl -X POST "https://YOUR_SITE.netlify.app/.netlify/functions/coach" \
     "level": "Beginner"
   }'
 ```
+
+### Debug the AI Function
+
+Open Netlify function logs and look for these safe log events:
+
+- `coach request received`
+- `Gemini request started`
+- `Gemini response received`
+- `Gemini response text length`
+- `JSON parsed successfully`
+- `validation failed reason`
+- `Gemini request timed out`
+
+The function does not log the API key and does not log the full user sentence. The frontend logs structured function errors to the browser console, while users still see a calm localized error message.
 
 ### Free-Tier Safety Notes
 
