@@ -254,6 +254,11 @@ textarea {
   border-color: var(--line);
 }
 
+.reset-profile-button {
+  color: var(--muted);
+  opacity: 0.82;
+}
+
 .content {
   width: min(100%, 1120px);
   margin: 0 auto;

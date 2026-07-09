@@ -63,7 +63,9 @@ const uiTranslations = {
       saved: "Saved",
       review: "Review",
       speaking: "Speak",
-      reflection: "Reflect"
+      reflection: "Reflect",
+      startOver: "Start over",
+      startOverConfirm: "Start over and clear this profile?"
     },
     onboarding: {
       title: "A little context is enough.",
@@ -265,7 +267,9 @@ const uiTranslations = {
       saved: "Gespeichert",
       review: "Wiederholen",
       speaking: "Sprechen",
-      reflection: "Reflexion"
+      reflection: "Reflexion",
+      startOver: "Neu starten",
+      startOverConfirm: "Neu starten und dieses Profil löschen?"
     },
     onboarding: {
       title: "Ein wenig Kontext reicht.",
@@ -467,7 +471,9 @@ const uiTranslations = {
       saved: "Guardado",
       review: "Repasar",
       speaking: "Hablar",
-      reflection: "Reflexión"
+      reflection: "Reflexión",
+      startOver: "Empezar de nuevo",
+      startOverConfirm: "¿Empezar de nuevo y borrar este perfil?"
     },
     onboarding: {
       title: "Un poco de contexto basta.",
@@ -669,7 +675,9 @@ const uiTranslations = {
       saved: "Salvati",
       review: "Ripasso",
       speaking: "Parla",
-      reflection: "Riflessione"
+      reflection: "Riflessione",
+      startOver: "Ricomincia",
+      startOverConfirm: "Ricominciare e cancellare questo profilo?"
     },
     onboarding: {
       title: "Basta un po' di contesto.",
@@ -871,7 +879,9 @@ const uiTranslations = {
       saved: "Enregistré",
       review: "Réviser",
       speaking: "Parler",
-      reflection: "Bilan"
+      reflection: "Bilan",
+      startOver: "Recommencer",
+      startOverConfirm: "Recommencer et effacer ce profil ?"
     },
     onboarding: {
       title: "Un peu de contexte suffit.",
@@ -1081,7 +1091,21 @@ const interestOptions = [
 const levelOptions = ["beginner", "elementary", "intermediate", "advanced"];
 
 const app = document.querySelector("#app");
+if (shouldResetOnLoad()) {
+  clearStoredState();
+}
 const state = loadState();
+
+function shouldResetOnLoad() {
+  return new URLSearchParams(window.location.search).get("reset") === "1";
+}
+
+function clearStoredState() {
+  localStorage.removeItem(STORAGE_KEY);
+  localStorage.removeItem(LEGACY_STORAGE_KEY);
+  sessionStorage.removeItem(STORAGE_KEY);
+  sessionStorage.removeItem(LEGACY_STORAGE_KEY);
+}
 
 function loadState() {
   const saved = localStorage.getItem(STORAGE_KEY) ?? localStorage.getItem(LEGACY_STORAGE_KEY);
@@ -1089,8 +1113,7 @@ function loadState() {
     try {
       return migrateState(JSON.parse(saved));
     } catch {
-      localStorage.removeItem(STORAGE_KEY);
-      localStorage.removeItem(LEGACY_STORAGE_KEY);
+      clearStoredState();
     }
   }
 
@@ -1099,7 +1122,7 @@ function loadState() {
 
 function getDefaultState() {
   return {
-    screen: "welcome",
+    screen: "onboarding",
     profile: {
       name: "",
       age: "",
@@ -1147,7 +1170,7 @@ function migrateState(input) {
   };
 
   if (!["welcome", "onboarding", "home", "saved", "review", "speaking", "reflection"].includes(migrated.screen)) {
-    migrated.screen = "welcome";
+    migrated.screen = defaults.screen;
   }
 
   return migrated;
@@ -1296,6 +1319,9 @@ function renderNav() {
           `
         )
         .join("")}
+      <button class="nav-button reset-profile-button" data-action="reset-profile" type="button">
+        ${t("nav.startOver")}
+      </button>
     </nav>
   `;
 }
@@ -1304,6 +1330,16 @@ function bindNav() {
   app.querySelectorAll("[data-screen]").forEach((button) => {
     button.addEventListener("click", () => setScreen(button.dataset.screen));
   });
+  app.querySelectorAll("[data-action='reset-profile']").forEach((button) => {
+    button.addEventListener("click", confirmAndResetProfile);
+  });
+}
+
+function confirmAndResetProfile() {
+  if (!window.confirm(t("nav.startOverConfirm"))) return;
+  clearStoredState();
+  Object.assign(state, getDefaultState());
+  render();
 }
 
 function renderOnboarding() {
@@ -2000,12 +2036,7 @@ function renderReflection() {
 }
 
 function bindReflection() {
-  app.querySelector("[data-action='reset-demo']").addEventListener("click", () => {
-    localStorage.removeItem(STORAGE_KEY);
-    localStorage.removeItem(LEGACY_STORAGE_KEY);
-    Object.assign(state, loadState());
-    render();
-  });
+  app.querySelector("[data-action='reset-demo']")?.addEventListener("click", confirmAndResetProfile);
 }
 
 const coachService = {
@@ -2033,7 +2064,9 @@ const coachService = {
       error.details = {
         status: response.status,
         error: data?.error || "COACH_REQUEST_FAILED",
-        message: data?.message || "Coach request failed."
+        message: data?.message || "Coach request failed.",
+        geminiStatus: data?.geminiStatus,
+        geminiMessage: data?.geminiMessage
       };
       throw error;
     }

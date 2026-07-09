@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-const GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/interactions";
+const GEMINI_API_BASE = "https://generativelanguage.googleapis.com";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
 const MAX_SENTENCE_LENGTH = 500;
 const GEMINI_TIMEOUT_MS = 14_000;
@@ -12,66 +12,6 @@ const requestBuckets = new Map();
 const jsonHeaders = {
   "Content-Type": "application/json",
   "Cache-Control": "no-store"
-};
-
-const responseSchema = {
-  type: "object",
-  properties: {
-    naturalTranslation: {
-      type: "string",
-      description: "A natural translation of the user's sentence in the target language."
-    },
-    literalMeaning: {
-      type: "string",
-      description: "A short literal explanation in the native language, only if useful."
-    },
-    simpleGrammar: {
-      type: "string",
-      description: "One or two short grammar points in the native language."
-    },
-    usefulChunks: {
-      type: "array",
-      minItems: 2,
-      maxItems: 5,
-      items: {
-        type: "object",
-        properties: {
-          chunk: {
-            type: "string",
-            description: "A useful phrase or chunk in the target language."
-          },
-          meaning: {
-            type: "string",
-            description: "The meaning of the chunk in the native language."
-          }
-        },
-        required: ["chunk", "meaning"],
-        additionalProperties: false
-      }
-    },
-    similarExamples: {
-      type: "array",
-      minItems: 2,
-      maxItems: 3,
-      items: {
-        type: "string",
-        description: "A similar useful sentence in the target language."
-      }
-    },
-    tryAgainPrompt: {
-      type: "string",
-      description: "One active recall prompt in the native language."
-    }
-  },
-  required: [
-    "naturalTranslation",
-    "literalMeaning",
-    "simpleGrammar",
-    "usefulChunks",
-    "similarExamples",
-    "tryAgainPrompt"
-  ],
-  additionalProperties: false
 };
 
 const systemInstruction = `You are Nativo, a calm science-based language coach. Return only strict JSON with exactly these keys: naturalTranslation, literalMeaning, simpleGrammar, usefulChunks, similarExamples, tryAgainPrompt. Translate naturally into targetLanguage. Write literalMeaning, simpleGrammar, usefulChunks.meaning, and tryAgainPrompt in nativeLanguage. Write naturalTranslation, usefulChunks.chunk, and similarExamples in targetLanguage. Keep output short. Use 2-5 phrase chunks, not isolated words. Use 2-3 similar examples. No markdown, lessons, games, or multiple-choice.`;
@@ -118,53 +58,86 @@ export default async function handler(req, context) {
   const nativeLanguage = payload.nativeLanguage.trim();
   const targetLanguage = payload.targetLanguage.trim();
   const level = (payload.level || "Beginner").trim();
+  const modelPath = normalizeModelPath(GEMINI_MODEL);
+  const endpointPath = `/v1beta/${modelPath}:generateContent`;
+  const geminiEndpoint = `${GEMINI_API_BASE}${endpointPath}?key=${encodeURIComponent(apiKey)}`;
+  const geminiRequestBody = buildGeminiRequestBody({
+    nativeLanguage,
+    targetLanguage,
+    level,
+    userSentence
+  });
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
 
   try {
     safeLog(requestId, "Gemini request started", {
-      model: GEMINI_MODEL,
+      selectedModel: GEMINI_MODEL,
+      endpointPath,
       nativeLanguage,
       targetLanguage,
       level,
-      sentenceLength: userSentence.length
+      sentenceLength: userSentence.length,
+      requestKeys: Object.keys(geminiRequestBody),
+      generationConfigKeys: Object.keys(geminiRequestBody.generationConfig)
     });
 
-    const geminiResponse = await fetch(GEMINI_ENDPOINT, {
+    let geminiResponse = await fetch(geminiEndpoint, {
       method: "POST",
       signal: controller.signal,
       headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": apiKey
+        "Content-Type": "application/json"
       },
-      body: JSON.stringify({
-        model: GEMINI_MODEL,
-        system_instruction: systemInstruction,
-        input: JSON.stringify({
-          nativeLanguage,
-          targetLanguage,
-          level,
-          userSentence
-        }),
-        generation_config: {
-          temperature: 0.2,
-          thinking_level: "low",
-          max_output_tokens: 500
-        },
-        response_format: {
-          type: "text",
-          mime_type: "application/json",
-          schema: responseSchema
-        }
-      })
+      body: JSON.stringify(geminiRequestBody)
     });
-    clearTimeout(timeout);
 
     safeLog(requestId, "Gemini response received", { status: geminiResponse.status, ok: geminiResponse.ok });
 
+    if (!geminiResponse.ok && geminiResponse.status === 400 && geminiRequestBody.generationConfig.responseMimeType) {
+      const firstGeminiErrorMessage = await readGeminiError(geminiResponse);
+      safeLog(requestId, "Gemini error message", {
+        status: geminiResponse.status,
+        message: firstGeminiErrorMessage
+      });
+
+      const fallbackRequestBody = buildPlainJsonPromptRequestBody(geminiRequestBody);
+      safeLog(requestId, "Gemini request started", {
+        selectedModel: GEMINI_MODEL,
+        endpointPath,
+        retryWithoutResponseMimeType: true,
+        requestKeys: Object.keys(fallbackRequestBody),
+        generationConfigKeys: Object.keys(fallbackRequestBody.generationConfig)
+      });
+
+      geminiResponse = await fetch(geminiEndpoint, {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(fallbackRequestBody)
+      });
+
+      safeLog(requestId, "Gemini response received", {
+        status: geminiResponse.status,
+        ok: geminiResponse.ok,
+        retryWithoutResponseMimeType: true
+      });
+    }
+
+    clearTimeout(timeout);
+
     if (!geminiResponse.ok) {
+      const geminiErrorMessage = await readGeminiError(geminiResponse);
+      safeLog(requestId, "Gemini error message", {
+        status: geminiResponse.status,
+        message: geminiErrorMessage
+      });
       safeLog(requestId, "validation failed reason", { reason: "GEMINI_REQUEST_FAILED", status: geminiResponse.status });
-      return errorResponse("GEMINI_REQUEST_FAILED", "Gemini request failed.", 502);
+      return errorResponse("GEMINI_REQUEST_FAILED", "Gemini request failed.", 502, {
+        geminiStatus: geminiResponse.status,
+        geminiMessage: geminiErrorMessage
+      });
     }
 
     const geminiData = await geminiResponse.json();
@@ -234,6 +207,61 @@ function validatePayload(payload) {
   }
 
   return null;
+}
+
+function normalizeModelPath(model) {
+  const trimmed = String(model || "").trim() || "gemini-2.5-flash-lite";
+  return trimmed.includes("/") ? trimmed : `models/${trimmed}`;
+}
+
+function buildGeminiRequestBody({ nativeLanguage, targetLanguage, level, userSentence }) {
+  return {
+    systemInstruction: {
+      parts: [{ text: systemInstruction }]
+    },
+    contents: [
+      {
+        role: "user",
+        parts: [
+          {
+            text: [
+              "Create one short Nativo learning card for this exact sentence.",
+              "Return only valid JSON. Do not include markdown, comments, or extra text.",
+              "Use exactly this JSON shape:",
+              '{"naturalTranslation":"","literalMeaning":"","simpleGrammar":"","usefulChunks":[{"chunk":"","meaning":""}],"similarExamples":[],"tryAgainPrompt":""}',
+              `nativeLanguage: ${nativeLanguage}`,
+              `targetLanguage: ${targetLanguage}`,
+              `level: ${level}`,
+              `userSentence: ${userSentence}`,
+              "Language rules:",
+              "- naturalTranslation, usefulChunks.chunk, and similarExamples must be in targetLanguage.",
+              "- literalMeaning, simpleGrammar, usefulChunks.meaning, and tryAgainPrompt must be in nativeLanguage.",
+              "- Explain only one or two useful grammar points.",
+              "- Use 2 to 5 useful phrase chunks, not isolated vocabulary.",
+              "- Use 2 or 3 similar real-life examples.",
+              "- Keep every field short and practical.",
+              "- Do not create lessons, multiple-choice tasks, or gamified text."
+            ].join("\n")
+          }
+        ]
+      }
+    ],
+    generationConfig: {
+      temperature: 0.2,
+      maxOutputTokens: 500,
+      responseMimeType: "application/json"
+    }
+  };
+}
+
+function buildPlainJsonPromptRequestBody(requestBody) {
+  const generationConfig = { ...requestBody.generationConfig };
+  delete generationConfig.responseMimeType;
+
+  return {
+    ...requestBody,
+    generationConfig
+  };
 }
 
 function normalizeCoachResponse(value) {
@@ -310,6 +338,35 @@ function parseError(message) {
   const error = new Error(message);
   error.code = "AI_RESPONSE_PARSE_FAILED";
   return error;
+}
+
+async function readGeminiError(response) {
+  let text = "";
+  try {
+    text = await response.text();
+  } catch {
+    return "Could not read Gemini error body.";
+  }
+
+  if (!text.trim()) {
+    return "Gemini returned an empty error body.";
+  }
+
+  try {
+    const body = JSON.parse(text);
+    return asSafeErrorMessage(body?.error?.message || body?.message || text);
+  } catch {
+    return asSafeErrorMessage(text);
+  }
+}
+
+function asSafeErrorMessage(message) {
+  return String(message ?? "")
+    .replace(/key=([^&\s]+)/gi, "key=[redacted]")
+    .replace(/AIza[0-9A-Za-z_-]+/g, "[redacted]")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 240);
 }
 
 function validateCoachResponse(value) {
@@ -391,8 +448,8 @@ function jsonResponse(body, status) {
   });
 }
 
-function errorResponse(error, message, status) {
-  return jsonResponse({ error, message }, status);
+function errorResponse(error, message, status, details = {}) {
+  return jsonResponse({ error, message, ...details }, status);
 }
 
 function safeLog(requestId, event, details = {}) {

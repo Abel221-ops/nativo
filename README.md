@@ -90,10 +90,11 @@ The Netlify free plan should be enough for a small prototype. Gemini also offers
 After deployment:
 
 1. Open the Netlify site URL.
-2. Complete onboarding.
-3. Enter a short sentence under 500 characters.
-4. Submit it.
-5. Confirm the learning card is specific to that sentence.
+2. For a fresh test profile, open the site with `?reset=1`, for example `https://YOUR_SITE.netlify.app/?reset=1`.
+3. Complete onboarding.
+4. Enter a short sentence under 500 characters.
+5. Submit it.
+6. Confirm the learning card is specific to that sentence.
 
 You can also test the function endpoint directly with your deployed URL:
 
@@ -114,7 +115,9 @@ Open Netlify function logs and look for these safe log events:
 
 - `coach request received`
 - `Gemini request started`
+- selected model and endpoint path, without the API key
 - `Gemini response received`
+- `Gemini error message`
 - `Gemini response text length`
 - `JSON parsed successfully`
 - `validation failed reason`
